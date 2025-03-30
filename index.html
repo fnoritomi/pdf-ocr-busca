@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Busca com texto e OCR em PDF</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    input, button { padding: 6px; font-size: 1em; margin-top: 5px; }
+    #resultado { margin-top: 20px; white-space: pre-line; }
+  </style>
+</head>
+<body>
+  <h2>Buscar texto (nativo + OCR opcional) em PDF</h2>
+
+  <label for="fileInput">Escolha o arquivo PDF:</label><br>
+  <input type="file" id="fileInput" accept="application/pdf"><br><br>
+
+  <label for="termosInput">Termos a buscar (separados por vírgula):</label><br>
+  <input type="text" id="termosInput" placeholder="Ex: saúde, dados, hospital" size="50"><br><br>
+
+  <label><input type="checkbox" id="usarOcr" checked> Usar OCR se texto não for encontrado</label><br><br>
+
+  <button id="buscarBtn">Buscar</button>
+  <button id="exportarBtn" disabled>Exportar PDF com páginas encontradas</button>
+
+  <div id="resultado"></div>
+
+  <!-- Bibliotecas -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.13.216/pdf.min.js"></script>
+  <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+  <script src="https://unpkg.com/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
+
+  <script>
+    let paginasEncontradas = [];
+    let arquivoOriginal = null;
+
+    document.getElementById('buscarBtn').addEventListener('click', async () => {
+      const fileInput = document.getElementById('fileInput');
+      const termosInput = document.getElementById('termosInput');
+      const usarOcr = document.getElementById('usarOcr').checked;
+      const resultadoDiv = document.getElementById('resultado');
+      const exportarBtn = document.getElementById('exportarBtn');
+
+      exportarBtn.disabled = true;
+      resultadoDiv.innerText = "🔄 Processando PDF...";
+
+      if (!fileInput.files.length) {
+        alert("Selecione um arquivo PDF.");
+        return;
+      }
+
+      const termos = termosInput.value
+        .split(',')
+        .map(t => t.trim().toLowerCase())
+        .filter(t => t.length > 0);
+
+      if (termos.length === 0) {
+        alert("Informe pelo menos um termo para buscar.");
+        return;
+      }
+
+      const file = fileInput.files[0];
+      arquivoOriginal = file;
+      const fileReader = new FileReader();
+
+      fileReader.onload = async function () {
+        const typedarray = new Uint8Array(this.result);
+        const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
+
+        const resultado = {};
+        termos.forEach(t => resultado[t] = []);
+        const paginasSet = new Set();
+        const paginasNaoEncontradas = [];
+
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+          resultadoDiv.innerText = `📄 Verificando texto da página ${pageNum} de ${pdf.numPages}...`;
+
+          const page = await pdf.getPage(pageNum);
+          const content = await page.getTextContent();
+          const texto = content.items.map(item => item.str).join(" ").toLowerCase();
+
+          let encontrou = false;
+
+          termos.forEach(termo => {
+            if (texto.includes(termo)) {
+              resultado[termo].push(pageNum);
+              paginasSet.add(pageNum);
+              encontrou = true;
+            }
+          });
+
+          if (!encontrou) {
+            paginasNaoEncontradas.push({ pageNum, page });
+          }
+        }
+
+        // OCR nas páginas que não tiveram texto nativo
+        if (usarOcr) {
+          for (const { pageNum, page } of paginasNaoEncontradas) {
+            resultadoDiv.innerText = `🔎 Aplicando OCR na página ${pageNum}...`;
+
+            const viewport = page.getViewport({ scale: 2.0 });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const context = canvas.getContext('2d');
+            await page.render({ canvasContext: context, viewport }).promise;
+
+            const { data: { text } } = await Tesseract.recognize(canvas, 'por', {
+              logger: m => console.log(`OCR pág. ${pageNum}: ${m.status}`)
+            });
+
+            const textoOCR = text.toLowerCase();
+            termos.forEach(termo => {
+              if (textoOCR.includes(termo)) {
+                resultado[termo].push(pageNum);
+                paginasSet.add(pageNum);
+              }
+            });
+          }
+        }
+
+        paginasEncontradas = Array.from(paginasSet).sort((a, b) => a - b);
+        exportarBtn.disabled = paginasEncontradas.length === 0;
+
+        // Exibir resultado
+        let textoResultado = `✅ Resultado da busca:\n\n`;
+        for (const termo of termos) {
+          const paginas = resultado[termo];
+          textoResultado += `🔍 "${termo}": ${paginas.length ? 'páginas ' + paginas.join(', ') : 'nenhuma página encontrada'}\n`;
+        }
+        if (paginasEncontradas.length > 0) {
+          textoResultado += `\n📁 Total de páginas a exportar: ${paginasEncontradas.length}`;
+        } else {
+          textoResultado += `\n⚠️ Nenhuma página encontrada para exportar.`;
+        }
+
+        resultadoDiv.innerText = textoResultado;
+      };
+
+      fileReader.readAsArrayBuffer(file);
+    });
+
+    document.getElementById('exportarBtn').addEventListener('click', async () => {
+      if (!arquivoOriginal || paginasEncontradas.length === 0) {
+        alert("Nada para exportar.");
+        return;
+      }
+
+      const originalBytes = await arquivoOriginal.arrayBuffer();
+      const pdfDocOrig = await PDFLib.PDFDocument.load(originalBytes);
+      const novoPdf = await PDFLib.PDFDocument.create();
+
+      const paginas = await novoPdf.copyPages(pdfDocOrig, paginasEncontradas.map(p => p - 1));
+      paginas.forEach(p => novoPdf.addPage(p));
+
+      const pdfBytes = await novoPdf.save();
+
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "pdf_filtrado_ocr.pdf";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
